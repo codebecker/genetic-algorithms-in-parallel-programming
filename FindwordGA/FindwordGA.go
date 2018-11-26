@@ -11,7 +11,7 @@ import (
 type FindwordGA struct {
 	gaID                             int
 	populationSize                   int
-	mutationRate                     float64
+	mutationRate                     float32
 	solution                         []byte
 	alphabet                         []byte
 	alphabetLength                   int
@@ -33,6 +33,7 @@ type FindwordGA struct {
 	receiveChannel                   []chan [][]byte
 	doneChannelMutex                 *sync.Mutex
 	doneChannel                      chan bool //size 1
+	mutationDoneChan                 chan int
 	numberOfIndividualsToBeExchanged int
 	exchangeInterval                 int
 	numberOfSendRcvChannel           int
@@ -42,13 +43,16 @@ type FindwordGA struct {
 
 	averageFitnessHist     []float32
 	standardDerivationHist []float32
+	randomForThreads       []*rand.Rand
 }
 
+//set ID of GA
 func (m *FindwordGA) SetGaID(gaID int) {
 	m.gaID = gaID
 }
 
-func (m *FindwordGA) InitPopulation(initSolution []byte, initAlphabet []byte, initPopulationSize int, initMutationRate float64, logPop bool, initSeed int64, initNumberOfThreads int) {
+//setup the GA population with information about the population and solution
+func (m *FindwordGA) InitPopulation(initSolution []byte, initAlphabet []byte, initPopulationSize int, initMutationRate float32, logPop bool, initSeed int64, initNumberOfThreads int) {
 
 	/////////////////////////////////////////////////////////////////////
 	//Implementation of word finding genetic algorithm///////////////////
@@ -56,7 +60,19 @@ func (m *FindwordGA) InitPopulation(initSolution []byte, initAlphabet []byte, in
 
 	//TODO Store all or some populations in a list/map/array ? watch memory!
 	//TODO Produce some kind of a logfile
-	//TODO struct for all measure values
+	//TODO struct for all measured values
+
+	if initMutationRate < 0 {
+		panic("mutation rate must be greater than 0")
+	} else if len(initAlphabet) < 1 {
+		panic("alphabet must include chars")
+	} else if initPopulationSize < 1 {
+		panic("population size must be greater than 0")
+	} else if initNumberOfThreads < 1 {
+		panic("GA has to run with at least one thread")
+	} else if len(initSolution) < 1 {
+		panic("solution must include at least one char")
+	}
 
 	m.mutationRate = initMutationRate
 	m.solution = initSolution
@@ -69,9 +85,9 @@ func (m *FindwordGA) InitPopulation(initSolution []byte, initAlphabet []byte, in
 	m.populationBuffer = make([][]byte, initPopulationSize)
 	m.populationFitness = make([]int, initPopulationSize)
 	m.selectedParents = make([]int, initPopulationSize)
-	m.randomSourceSeed = initSeed
 	m.selectedParentsDensityFunction = make([]float32, m.populationSize)
 	m.numberOfThreads = initNumberOfThreads
+	m.mutationDoneChan = make(chan int, m.numberOfThreads)
 
 	//if it is running alone
 	m.doneChannel = make(chan bool, 1)
@@ -83,8 +99,12 @@ func (m *FindwordGA) InitPopulation(initSolution []byte, initAlphabet []byte, in
 	} else {
 		m.randomSourceSeed = time.Now().UnixNano()
 	}
-	var seedSource = rand.NewSource(m.randomSourceSeed)
-	m.random = rand.New(seedSource)
+	m.random = rand.New(rand.NewSource(m.randomSourceSeed))
+
+	m.randomForThreads = make([]*rand.Rand, m.numberOfThreads)
+	for i := 0; i < m.numberOfThreads; i++ {
+		m.randomForThreads[i] = rand.New(rand.NewSource(m.randomSourceSeed + int64(i)))
+	}
 
 	//filling the population with random strings
 	for i := 0; i < m.populationSize; i++ {
@@ -92,6 +112,7 @@ func (m *FindwordGA) InitPopulation(initSolution []byte, initAlphabet []byte, in
 	}
 }
 
+//setup to exchange individuals with other GA's running simultaneously
 func (m *FindwordGA) InitNetwork(exchangePercent float32,
 	initSendChannel []chan [][]byte,
 	initReceiveChannels []chan [][]byte,
@@ -112,6 +133,7 @@ func (m *FindwordGA) InitNetwork(exchangePercent float32,
 
 }
 
+//run GA with current setup must be initialized before
 func (m *FindwordGA) Run() {
 
 	fmt.Printf("Genetic Algorithm Number %d starts\n", m.gaID)
@@ -125,11 +147,11 @@ func (m *FindwordGA) Run() {
 	for {
 		m.calcStatistics()
 		if m.exchangeInterval != 0 && m.evolutionCount%m.exchangeInterval == 0 {
-			//fmt.Printf("mokeyID %d evolution will be exchanged %d\n",m.gaID,m.evolutionCount )
+			//fmt.Printf("GaId %d evolution will be exchanged %d\n",m.gaID,m.evolutionCount )
 			m.exchangeIndividuals()
 		}
 
-		m.solutionIndex = m.calcFitnessOfIndividuals()
+		m.solutionIndex = m.calcFitnessOfIndividualsMultiThread()
 
 		if m.log == true {
 			m.averageFitnessHist = append(m.averageFitnessHist, m.AverageFitnessInPercent)
@@ -142,11 +164,9 @@ func (m *FindwordGA) Run() {
 				}*/
 		}
 
+		//if solution was found OR other thread is done earlier
 		m.doneChannelMutex.Lock()
-		//solution was found OR other thread is done earlier
-
-		//TODO DEADLOCK HERE? MULTIPLE THREADS EACH PRODUCING AND CONSUMING
-		if true == <-m.doneChannel || m.solutionIndex >= 0 {
+		if <-m.doneChannel == true || m.solutionIndex >= 0 {
 			m.doneChannel <- true
 			m.doneChannelMutex.Unlock()
 			break
@@ -155,13 +175,12 @@ func (m *FindwordGA) Run() {
 			m.doneChannelMutex.Unlock()
 		}
 
-		//m.selectParentsDensityFunction()
-		//m.crossoverPopulationDensityFunction()
-		m.selectParents()
+		m.selectParentsSingleThread()
 		m.crossoverPopulation()
 
-		m.mutatePopulation()
-		m.evolutionCount = m.evolutionCount + 1
+		//m.mutatePopulation()
+		m.mutatePopulationMultiThread()
+		m.evolutionCount++
 
 	}
 
@@ -182,8 +201,8 @@ func (m *FindwordGA) Run() {
 
 }
 
+// Send and receive best individuals from connected GAs either synchronous or asynchronous
 func (m *FindwordGA) exchangeIndividuals() {
-	//// Send and receive best individuals from channels a- / synchronously
 
 	//TODO may make channels send channels with bigger size to send to multiple FindwordGA but then synchronus mode made cant be achieved to easy anymore
 	//TODO exchange every X evolutions IMPORTANT
@@ -232,8 +251,6 @@ func (m *FindwordGA) exchangeIndividuals() {
 		//test each channel empty it has content and write data
 		select {
 		case rcv := <-m.receiveChannel[i]:
-			//append fucks stuff up so init manually
-
 			//fmt.Printf("wordfindGA_ID %d RCV from %d \n", m.gaID, rcv[0][0])
 
 			receivedIndividualsCopyBuffer = make([][]byte, len(receivedIndividuals)+len(rcv))
@@ -268,10 +285,8 @@ func (m *FindwordGA) exchangeIndividuals() {
 	for i := 0; i < len(receivedIndividuals); {
 
 		for j := 0; j < len(m.populationFitness); j++ {
-
 			if m.populationFitness[j] == fitnessCurrentlySearched {
 				//deep copy
-
 				for k := 0; k < m.solutionLength; k++ {
 					receivedIndividuals[i][k] = m.population[j][k]
 					m.population[j][k] = receivedIndividuals[i][k]
@@ -286,6 +301,7 @@ func (m *FindwordGA) exchangeIndividuals() {
 	}
 }
 
+//generate a random string with specified number of chars
 func (m *FindwordGA) randomString(numberOfChars int) []byte {
 
 	randomString := make([]byte, numberOfChars)
@@ -296,16 +312,37 @@ func (m *FindwordGA) randomString(numberOfChars int) []byte {
 	return randomString
 }
 
-func (m *FindwordGA) calcFitnessOfIndividuals() int {
+//calculates the fitness of each individual in the population in a single thread
+func (m *FindwordGA) calcFitnessOfIndividualSingleThread() int {
+	fittest := -1
+	for i := 0; i < len(m.population); i++ {
+		fitnessOfIndividual := 0
+		for j := 0; j < m.solutionLength; j++ {
+			if m.population[i][j] == m.solution[j] {
+				fitnessOfIndividual++
+			}
+		}
+		m.populationFitness[i] = fitnessOfIndividual
+
+		//if a solution was found
+		if fitnessOfIndividual == m.solutionLength && fittest < 0 {
+			fittest = i
+		}
+	}
+	return fittest
+}
+
+//calculates the fitness of each individual in the population in multiple threads
+func (m *FindwordGA) calcFitnessOfIndividualsMultiThread() int {
 	solutionChan := make(chan int, m.numberOfThreads)
 	solution := -1
 
 	for i := 0; i < m.numberOfThreads; i++ {
 		//when this is the last thread and there is a rest from dividing throug numberOfThreads
-		if i == m.numberOfThreads-1 && m.populationSize%m.numberOfThreads != 0 {
-			go m.calcFitnessOfIndividualsParallel(solutionChan, i*(m.populationSize/m.numberOfThreads), (i+1)*int(m.populationSize/m.numberOfThreads)+(m.populationSize%m.numberOfThreads))
+		if i == m.numberOfThreads-1 {
+			go m.calcFitnessOfIndividualsThread(solutionChan, i*(m.populationSize/m.numberOfThreads), (i+1)*int(m.populationSize/m.numberOfThreads)+(m.populationSize%m.numberOfThreads))
 		} else {
-			go m.calcFitnessOfIndividualsParallel(solutionChan, i*(m.populationSize/m.numberOfThreads), (i+1)*m.populationSize/m.numberOfThreads)
+			go m.calcFitnessOfIndividualsThread(solutionChan, i*(m.populationSize/m.numberOfThreads), (i+1)*m.populationSize/m.numberOfThreads)
 		}
 	}
 
@@ -319,9 +356,10 @@ func (m *FindwordGA) calcFitnessOfIndividuals() int {
 	return solution
 }
 
-func (m *FindwordGA) calcFitnessOfIndividualsParallel(solutionChan chan int, startIndividual int, endIndividual int) int {
+//calculates the fitness of a certain part of the population necessary for multithreading
+func (m *FindwordGA) calcFitnessOfIndividualsThread(solutionChan chan int, start int, end int) int {
 	var fittest = -1
-	for i := startIndividual; i < endIndividual; i++ {
+	for i := start; i < end; i++ {
 		fitnessOfIndividual := 0
 		for j := 0; j < m.solutionLength; j++ {
 			if m.population[i][j] == m.solution[j] {
@@ -339,8 +377,9 @@ func (m *FindwordGA) calcFitnessOfIndividualsParallel(solutionChan chan int, sta
 	return fittest
 }
 
-func (m *FindwordGA) selectParents() {
-	//the fiter the individuals the more often their index will appear in the selectedParents array
+//calculates the probability of each individual to be chosen for crossover by its fitness in a single thread
+func (m *FindwordGA) selectParentsSingleThread() {
+	//the fitter the individuals the more often their index will appear in the selectedParents array
 	numberFitnessTotal := 0
 	for i := 0; i < m.populationSize; i++ {
 		numberFitnessTotal = numberFitnessTotal + m.populationFitness[i]
@@ -351,6 +390,7 @@ func (m *FindwordGA) selectParents() {
 		for i := 0; i < len(m.selectedParents); i++ {
 			m.selectedParents[i] = 1
 		}
+
 	} else {
 		m.selectedParents = make([]int, numberFitnessTotal)
 		fitnessCounter := 0
@@ -363,6 +403,17 @@ func (m *FindwordGA) selectParents() {
 	}
 }
 
+//calculates the probability of each individual to be chosen for crossover by its fitness in multiple threads
+func (m *FindwordGA) selectParentsMultiThread() {
+	// TODO
+}
+
+//calculates the probability of each individual to be chosen for crossover by its fitness in multiple threads
+func (m *FindwordGA) selectParentsThread() {
+	// TODO
+}
+
+//crossover all individuals in the population an replace old generation
 func (m *FindwordGA) crossoverPopulation() {
 	var areEqual = true
 	m.populationBuffer = make([][]byte, m.populationSize)
@@ -396,18 +447,20 @@ func (m *FindwordGA) crossoverPopulation() {
 	m.population = m.populationBuffer
 }
 
-// density functions may have better performance with huge populations.
-//because with array density the parents array can reach size of lenghtOf(int) * population * (1+avgFitness) with avgFitness [0,1.0]
-//whereas the parentsDensityFuntion Array always has the same size of population * sizeOf(float32)
+//calculate the probability a individual will be chosen for crossover with a density function
 func (m *FindwordGA) selectParentsDensityFunction() {
+	// density functions may have better performance with huge populations.
+	//because with array density the parents array can reach size of lenghtOf(int) * population * (1+avgFitness) with avgFitness [0,1.0]
+	//whereas the parentsDensityFuntion Array always has the same size of population * sizeOf(float32)
+
 	//erstellen eines stufigen wahrscheinlichkeitsdiagrammes w(i)= i + SUM(0,1)
-	//kandaten mit einer wahrscheinlichkeit von 0 ergeben keine abstufung und der vorangegangene kanidat wird gewählt
+	//kandidaten mit einer wahrscheinlichkeit von 0 ergeben keine abstufung und der vorangegangene kanidat wird gewählt
 	var numberFitnessTotal float32 = 0
 	for i := 0; i < m.populationSize; i++ {
 		numberFitnessTotal = numberFitnessTotal + float32(m.populationFitness[i])
 	}
 
-	//if total fitness number is zero each individual will be chosen with equal density
+	//if total fitness number is zero each individual will be choosen with equal density
 	if numberFitnessTotal == 0 {
 		for i := 0; i < len(m.selectedParents); i++ {
 			m.selectedParentsDensityFunction[i] = 1 / float32(m.populationSize)
@@ -422,6 +475,7 @@ func (m *FindwordGA) selectParentsDensityFunction() {
 	}
 }
 
+//crossover all individuals in the population and replace old generation with density function
 func (m *FindwordGA) crossoverPopulationDensityFunction() {
 	//crossover population using a buffer for new population
 	//TODO add better method for crossover individuals replace selected parents
@@ -478,17 +532,65 @@ func (m *FindwordGA) crossoverPopulationDensityFunction() {
 	m.population = m.populationBuffer
 }
 
+//randomly chose individuals and change a single char
 func (m *FindwordGA) mutatePopulation() {
-	//TODO Umverteilung auf genau n aus population und keine doppelt ???
 
 	individualsLength := m.solutionLength
 	for i := 0; i < m.populationSize; i++ {
-		if m.random.Float64() < m.mutationRate {
+		if m.random.Float32() < m.mutationRate {
 			m.population[i][m.random.Intn(individualsLength)] = m.alphabet[m.random.Intn(len(m.alphabet))]
 		}
 	}
+
 }
 
+//randomly chose individuals and change a single char
+func (m *FindwordGA) mutatePopulationMultiThread() {
+
+	// random distribution of mutation rate between the threads for better randomness
+	mutationRateThreads := make([]float32, m.numberOfThreads)
+	var distributionSum float32
+
+	for i := 0; i < m.numberOfThreads; i++ {
+		mutationRateThreads[i] = m.random.Float32()
+		distributionSum += mutationRateThreads[i]
+	}
+
+	for i := 0; i < m.numberOfThreads; i++ {
+		//random density distribution between mutation threads seems to be slower
+		//mutationRateThreads[i] = mutationRateThreads[i]/ distributionSum*m.mutationRate*float32(m.numberOfThreads)
+
+		//same density between all mutation threads seems to be faster
+		mutationRateThreads[i] = m.mutationRate
+	}
+
+	for i := 0; i < m.numberOfThreads; i++ {
+
+		//when this is the last thread and there is a rest from dividing through numberOfThreads
+		if i == m.numberOfThreads-1 {
+			go m.mutatePopulationThread(i*(m.populationSize/m.numberOfThreads), (i+1)*int(m.populationSize/m.numberOfThreads)+(m.populationSize%m.numberOfThreads), m.mutationDoneChan, i, mutationRateThreads[i])
+		} else {
+			go m.mutatePopulationThread(i*(m.populationSize/m.numberOfThreads), (i+1)*m.populationSize/m.numberOfThreads, m.mutationDoneChan, i, mutationRateThreads[i])
+		}
+	}
+
+	for i := 0; i < m.numberOfThreads; i++ {
+		<-m.mutationDoneChan
+	}
+}
+
+//randomly chose individuals and change a single char
+func (m *FindwordGA) mutatePopulationThread(start int, end int, mutationDoneChan chan int, threadNumber int, threadsMutationRate float32) {
+	random := m.randomForThreads[threadNumber]
+	for i := start; i < end; i++ {
+		if random.Float32() < threadsMutationRate {
+			m.population[i][random.Intn(m.solutionLength)] = m.alphabet[random.Intn(len(m.alphabet))]
+		}
+	}
+	mutationDoneChan <- 1
+}
+
+//save the current population to a slice for analysis
 func (m *FindwordGA) savePop() {
 	deepCpy := make([][]byte, m.populationSize)
 	for i := 0; i < m.populationSize; i++ {
@@ -503,6 +605,7 @@ func (m *FindwordGA) savePop() {
 	m.populationHistory = append(m.populationHistory, deepCpy)
 }
 
+//calculate the average fitness and standard derivation of the current population
 func (m *FindwordGA) calcStatistics() {
 
 	//calc average fitness
@@ -519,6 +622,5 @@ func (m *FindwordGA) calcStatistics() {
 		avgDeviationFit += (float32(num) - avgFit) * (float32(num) - avgFit)
 	}
 	avgDeviationFit = avgDeviationFit / float32(len(m.populationFitness))
-
 	m.StandardDeviationInPercent = float32(math.Sqrt(float64(avgDeviationFit))) / float32(m.solutionLength)
 }

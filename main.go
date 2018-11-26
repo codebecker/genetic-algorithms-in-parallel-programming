@@ -8,12 +8,12 @@ import (
 
 func main() {
 
-	var seed int64 = 22238380
+	var seed int64 = 222383033
 	var solution = []byte("dragons are awesome")
 	var alphabet = []byte("abcdefghijklmnopqrstuvwxyz ")
-	var mutationRate float64 = 0.2
+	var mutationRate float32 = 0.2
 	var exchangeInPercent float32 = 0.1
-	var populationSize = 10000
+	var populationSize = 100000
 
 	fmt.Println("=====================TEST WITH A SINGLE GA IN SINGLETHREAD===============================")
 
@@ -25,7 +25,7 @@ func main() {
 	fmt.Println("=====================TEST WITH A SINGLE GA IN MULTITHREADING===============================")
 
 	findWord2 := FindwordGA.FindwordGA{}
-	findWord2.InitPopulation(solution, alphabet, populationSize, mutationRate, false, seed, 5)
+	findWord2.InitPopulation(solution, alphabet, populationSize, mutationRate, false, seed, 3)
 	findWord2.Run()
 	fmt.Printf("Duration for multithreading in GA : %s \n", findWord2.Duration.String())
 
