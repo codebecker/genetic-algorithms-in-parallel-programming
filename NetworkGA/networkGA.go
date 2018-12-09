@@ -2,7 +2,6 @@ package NetworkGA
 
 import (
 	"../FindwordGA"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -14,7 +13,7 @@ type NetworkGA struct {
 	Duration        time.Duration
 }
 
-func (s *NetworkGA) NetworkGA(solution []byte, alphabet []byte, populationSize int, mutationRate float32, logPop bool, seed int64,
+func (s *NetworkGA) NetworkGA(solution []byte, alphabet []byte, populationSize int, mutationRate float32, seed int64,
 	exchangePercent float32, connections [][]int, exchangeInterval int) {
 
 	if mutationRate < 0 {
@@ -35,6 +34,12 @@ func (s *NetworkGA) NetworkGA(solution []byte, alphabet []byte, populationSize i
 		panic("exchange interval must be greater than 0")
 	}
 
+	for i := 0; i < len(connections); i++ {
+		if len(connections) != len(connections[i]) {
+			panic("connections Array must have same width and height in both dimensions")
+		}
+	}
+
 	var doneChannelMutex = sync.Mutex{}
 	var sendToChannel = make([][]chan [][]byte, len(connections))
 	var rcvFromChannel = make([][]chan [][]byte, len(connections))
@@ -49,7 +54,7 @@ func (s *NetworkGA) NetworkGA(solution []byte, alphabet []byte, populationSize i
 	for i := 0; i < len(gaConnectionArray); i++ {
 		gaConnectionArray[i] = FindwordGA.FindwordGA{}
 		gaConnectionArray[i].SetGaID(i)
-		gaConnectionArray[i].InitPopulation(solution, alphabet, populationSize, mutationRate, logPop, seed+int64(i*64), 1)
+		gaConnectionArray[i].InitPopulation(solution, alphabet, populationSize, mutationRate, seed+int64(i*64), 1)
 	}
 
 	//init network
@@ -74,16 +79,14 @@ func (s *NetworkGA) NetworkGA(solution []byte, alphabet []byte, populationSize i
 	for i := 0; i < len(connections); i++ {
 		gaConnectionArray[i].InitNetwork(exchangePercent, sendToChannel[i], rcvFromChannel[i], &wg, doneChannel, &doneChannelMutex, exchangeInterval)
 	}
-	fmt.Printf("==========================================GA NETWORK STARTS ======================================\n")
 
-	fmt.Printf("Starting word find genetic algorithm network with %d threads population size of %d each thread alphabet of %d chars and a solution size of %d\n", len(connections), populationSize, len(alphabet), len(solution))
 	startTime := time.Now()
-	//run all findwordGA in individual thread
+	//run all findwordGA in individual threads
 	for i := 0; i < len(gaConnectionArray); i++ {
 		go gaConnectionArray[i].Run()
 	}
 	wg.Wait()
-	fmt.Printf("==========================================GA NETWORK ENDS ========================================\n")
+	//fmt.Printf("==========================================GA NETWORK ENDS ========================================\n")
 
 	s.Duration = time.Now().Sub(startTime)
 }
